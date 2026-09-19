@@ -1,0 +1,461 @@
+module sh.sysl.libregexp
+@tests
+
+import sysl.text.str_builder
+
+// What this binding claims, run by `sysl test .`.
+//
+// **Every expected value below was produced by running node**, not recalled: the package's claim is
+// that it is ECMAScript, so the oracle is an ECMAScript engine. The spans are converted from
+// JavaScript's UTF-16 indices to the byte offsets this package reports, which is the one place the
+// two disagree on purpose.
+//
+// **The cases are chosen so that only real matching passes them.** A binding's failures are not a
+// library's: an `extern` that dropped an argument, a capture array sized by the group count instead
+// of by `alloc_count`, a UTF-16 index read as a byte offset -- each of those still compiles, still
+// links, and still answers something. A test that only asked "did it match" would pass against all
+// three, so the offsets here are mid-string and the groups are read by number and by name.
+
+private ok(r: Result[Option[Match], Error]) -> Match = r.expect("the match ran").expect("it matched")
+
+private re(pattern: string, flags: string) -> &Regex =
+    compile(pattern, flags).expect("the pattern compiled")
+
+// -- The dialect -------------------------------------------------------------------------------
+
+@test("the syntax that is JavaScript's and not POSIX's arrives: classes, lazy, lookaround, backrefs")
+the_javascript_syntax_arrives()
+    val m = ok(re("\\d+", "").find("abc123"))
+
+    assert_eq(m.text(), "123")
+    assert_eq(m.start(), usize(3))
+
+    assert_eq(ok(re("<(.+?)>", "").find("<a><b>")).text(), "<a>", "lazy stops at the first >")
+    assert_eq(ok(re("foo(?=bar)", "").find("foobar")).text(), "foo", "lookahead does not consume")
+    assert(re("foo(?=bar)", "").find("foobaz").expect("ran").is_none())
+    assert_eq(ok(re("(?<=\\$)\\d+", "").find("costs $42")).text(), "42", "lookbehind matches")
+    assert_eq(ok(re("(\\w)\\1", "").find("hello")).text(), "ll", "a backreference matches")
+    assert_eq(ok(re("(?:ab)+", "").find("ababab")).text(), "ababab")
+
+@test("the quantifiers agree with node on greed and on bounds")
+quantifiers()
+    assert_eq(ok(re("a+", "").find("aaa")).text(), "aaa", "greedy takes everything")
+    assert_eq(ok(re("a+?", "").find("aaa")).text(), "a", "lazy takes one")
+    assert_eq(ok(re("a{2,3}", "").find("aaaa")).text(), "aaa")
+    assert_eq(ok(re("a{2}", "").find("aaaa")).text(), "aa")
+    assert_eq(ok(re("ab?c", "").find("ac")).text(), "ac")
+
+@test("a backreference to a group that took no part matches the empty string, which is the trap")
+backreference_to_a_non_participating_group()
+    // `(?:(a)|b)\1c` against "bc": group 1 never participated, and ECMAScript says a backreference
+    // to such a group matches the empty string rather than failing. node answers a match at [0, 2)
+    // with group 1 undefined, which is the shape this pins.
+    val m = ok(re("(?:(a)|b)\\1c", "").find("bc"))
+
+    assert_eq(m.text(), "bc")
+    assert(m.span(1).is_none(), "the group took no part")
+
+@test("a group that took no part has no span, which is not the same as an empty one")
+unused_group_versus_empty_group()
+    val absent = ok(re("(a)|(b)", "").find("b"))
+
+    assert(absent.span(1).is_none(), "group 1 never ran")
+    assert_eq(absent.group(2).unwrap(), "b")
+
+    val empty = ok(re("(a*)b", "").find("b"))
+
+    assert_eq(empty.group(1).unwrap(), "", "group 1 ran and matched nothing")
+    assert_eq(empty.span(1).unwrap(), (usize(0), usize(0)))
+
+@test("group_count is the pattern's and not the match's, so it is the same for every match")
+group_count_comes_from_the_pattern()
+    val r = re("(a)|(b)|(c)", "")
+
+    assert_eq(r.group_count(), usize(3))
+    assert_eq(ok(r.find("b")).group_count(), usize(4), "group 0 and the three groups")
+    assert_eq(ok(r.find("c")).group_count(), usize(4))
+
+// -- Named groups ------------------------------------------------------------------------------
+
+@test("named groups are read back out of the compiled pattern, with the numbers they were given")
+named_groups()
+    val r = re("(?<year>\\d{4})-(?<month>\\d{2})", "")
+    val m = ok(r.find("on 2026-09-19"))
+
+    assert_eq(m.text(), "2026-09")
+    assert_eq(m.start(), usize(3))
+    assert_eq(r.group_named("year").unwrap(), usize(1))
+    assert_eq(r.group_named("month").unwrap(), usize(2))
+    assert(r.group_named("day").is_none())
+    assert_eq(m.group(r.group_named("year").unwrap()).unwrap(), "2026")
+
+@test("an unnamed group between two named ones does not shift the names, which the stride decides")
+named_groups_mixed_with_unnamed()
+    val r = re("(?<a>x)(\\d)(?<b>y)", "")
+    val gs = r.named_groups()
+
+    assert_eq(gs.len(), usize(2), "two of the three groups have names")
+    assert_eq(gs.at(0).name, "a")
+    assert_eq(gs.at(0).number, usize(1))
+    assert_eq(gs.at(1).name, "b")
+    assert_eq(gs.at(1).number, usize(3), "the unnamed group still took number 2")
+
+@test("a pattern with no named groups has none, rather than a block of empty ones")
+no_named_groups()
+    assert_eq(re("(a)(b)", "").named_groups().len(), usize(0))
+
+// -- Flags -------------------------------------------------------------------------------------
+
+@test("the flag letters are read as JavaScript reads them, and written back in its order")
+flags_round_trip()
+    val f = parse_flags("gimsy").expect("those are flags")
+
+    assert(f.global() && f.ignore_case() && f.multiline() && f.dot_all() && f.sticky())
+    assert(!f.unicode() && !f.indices())
+    assert_eq(f.text(), "gimsy")
+    assert_eq(parse_flags("dgu").expect("flags").text(), "dgu")
+    assert_eq(no_flags().text(), "")
+
+@test("a letter that is not a flag, a repeated flag, and u with v are each refused")
+bad_flags_are_refused()
+    assert(parse_flags("q").is_err(), "q is not a flag")
+    assert(parse_flags("gg").is_err(), "a flag may not be given twice")
+    assert(parse_flags("uv").is_err(), "u and v cannot both be set")
+    assert(parse_flags("v").is_ok(), "v on its own is a flag")
+
+@test("i, m and s each change what matches, told apart on subjects where they disagree")
+flags_change_the_match()
+    assert_eq(ok(re("HeLLo", "i").find("say hello")).start(), usize(4))
+    assert(re("HeLLo", "").find("say hello").expect("ran").is_none())
+
+    val lines = re("^\\w+", "gm").find_all("one\ntwo").expect("ran")
+
+    assert_eq(lines.len(), usize(2), "m makes ^ match after a line break")
+    assert_eq(lines.at(1).start(), usize(4))
+    assert_eq(re("^\\w+", "g").find_all("one\ntwo").expect("ran").len(), usize(1))
+
+    assert_eq(ok(re("a.b", "s").find("a\nb")).text(), "a\nb", "s makes . match a line break")
+    assert(re("a.b", "").find("a\nb").expect("ran").is_none())
+
+@test("a compiled pattern reports the flags it was given, read back out of its bytecode")
+flags_are_read_back_from_the_bytecode()
+    assert_eq(re("x", "gimsuy").flags().text(), "gimsuy")
+    assert_eq(re("x", "d").flags().text(), "d")
+    assert_eq(re("x", "").flags().text(), "")
+
+// -- Sticky ------------------------------------------------------------------------------------
+
+@test("a sticky pattern matches only where the search began, which is the lastIndex loop")
+sticky()
+    val r = re("\\d+", "y")
+
+    assert_eq(ok(r.find("12ab34")).text(), "12")
+    assert(r.find("ab34").expect("ran").is_none(), "sticky does not search forward")
+    assert_eq(ok(r.find_at("ab34", 2)).text(), "34", "and does match at the offset given")
+
+    // The same pattern without `y` does search forward, which is what makes the test above about
+    // the flag rather than about the offset.
+    assert_eq(ok(re("\\d+", "").find("ab34")).text(), "34")
+
+// -- The empty-match walk ----------------------------------------------------------------------
+
+@test("an end-of-string pattern finds exactly one match, not one for ever")
+the_dollar_walk_terminates()
+    val ms = re("$", "g").find_all("abc").expect("ran")
+
+    assert_eq(ms.len(), usize(1))
+    assert_eq(ms.at(0).span(0).unwrap(), (usize(3), usize(3)))
+
+@test("a pattern that can match nothing finds the four matches node finds in baaac")
+the_empty_match_advance_rule()
+    val ms = re("a*", "g").find_all("baaac").expect("ran")
+
+    assert_eq(ms.len(), usize(4))
+    assert_eq(ms.at(0).span(0).unwrap(), (usize(0), usize(0)))
+    assert_eq(ms.at(1).span(0).unwrap(), (usize(1), usize(4)))
+    assert_eq(ms.at(2).span(0).unwrap(), (usize(4), usize(4)))
+    assert_eq(ms.at(3).span(0).unwrap(), (usize(5), usize(5)))
+
+@test("an empty pattern and an empty subject are each legal, and neither is a null pointer")
+the_empty_cases()
+    // **`as_ptr` of an empty slice is null, and libregexp reads its buffers without checking.** Both
+    // of these faulted before the package passed storage of its own instead, and both are ordinary
+    // ECMAScript: `new RegExp("")` matches everywhere and `"".match(/a*/)` answers an empty match.
+    assert_eq(re("", "g").find_all("abc").expect("ran").len(), usize(4))
+    assert_eq(ok(re("a*", "").find("")).span(0).unwrap(), (usize(0), usize(0)))
+    assert(re("a", "").find("").expect("ran").is_none())
+    assert_eq(re("", "").replace_all("", "-").expect("ran"), "-")
+    assert(re("", "").is_match("").expect("ran"))
+
+@test("a starting offset past the end of the subject is no match rather than a fault")
+searching_past_the_end()
+    val r = re("a*", "")
+
+    assert(r.find_at("abc", 4).expect("ran").is_none())
+    assert_eq(ok(r.find_at("abc", 3)).span(0).unwrap(), (usize(3), usize(3)), "the end itself matches")
+
+@test("the empty pattern matches once at every boundary and once past the end")
+the_empty_pattern_walk()
+    val ms = re("", "g").find_all("abc").expect("ran")
+
+    assert_eq(ms.len(), usize(4))
+    assert_eq(ms.at(3).start(), usize(3))
+
+// -- Unicode -----------------------------------------------------------------------------------
+
+@test("offsets are byte offsets into the UTF-8 subject, over mixed 1-, 2-, 3- and 4-byte text")
+byte_offsets_over_mixed_width_text()
+    // "aéébüñ": a=1 byte, é=2, é=2, b=1, ü=2, ñ=2. node reports the run of é's at UTF-16 [1, 3),
+    // which is bytes [1, 5).
+    val m = ok(re("é+", "").find("aéébüñ"))
+
+    assert_eq(m.span(0).unwrap(), (usize(1), usize(5)))
+    assert_eq(m.text(), "éé")
+
+    // A 3-byte character beside a 2-byte one: "a€£b" is 1 + 3 + 2 + 1 bytes, so the run of the two
+    // is [1, 6) -- a span no code-unit count and no character count would have produced.
+    val euro = ok(re("[€£]+", "u").find("a€£b"))
+
+    assert_eq(euro.span(0).unwrap(), (usize(1), usize(6)))
+    assert_eq(euro.text(), "€£")
+
+@test("an astral escape matches an astral character under u, and its span is the four bytes")
+astral_under_u()
+    val m = ok(re("\\u{1F600}", "u").find("hi 😀 there"))
+
+    assert_eq(m.span(0).unwrap(), (usize(3), usize(7)))
+    assert_eq(m.text(), "😀")
+
+@test("under u a dot is one code point, and without it the astral character is two code units")
+a_dot_under_u_and_without_it()
+    // With `u`, node's `.` over "😀" finds one match covering the whole character.
+    val with_u = re(".", "gu").find_all("😀").expect("ran")
+
+    assert_eq(with_u.len(), usize(1))
+    assert_eq(with_u.at(0).span(0).unwrap(), (usize(0), usize(4)))
+
+    // Without `u` it finds two -- one per surrogate. Neither half is a position a UTF-8 string has,
+    // so each span is rounded outward to the whole character and the walk then steps past it. What
+    // this package promises is that the offsets stay on character boundaries; it does not promise a
+    // JavaScript index.
+    val without = re(".", "g").find_all("😀").expect("ran")
+
+    assert_eq(without.len(), usize(1))
+    assert_eq(without.at(0).span(0).unwrap(), (usize(0), usize(4)))
+
+@test("a property escape is available under u and selects letters across scripts")
+property_escapes()
+    val ms = re("\\p{L}+", "gu").find_all("ab1цд2").expect("ran")
+
+    assert_eq(ms.len(), usize(2))
+    assert_eq(ms.at(0).text(), "ab")
+    assert_eq(ms.at(1).span(0).unwrap(), (usize(3), usize(7)), "цд is two 2-byte characters")
+    // **Without `u` it is not a property escape at all**, and node agrees: `\p` is an identity
+    // escape there, so the pattern is the literal text `p{L}`. It compiles and matches nothing a
+    // letter would -- the silent case, which is why the assertion is about what it matches rather
+    // than about a refusal.
+    val literal = re("\\p{L}", "")
+
+    assert(literal.find("a").expect("ran").is_none(), "no letter matches it")
+    assert_eq(ok(literal.find("p{L}")).text(), "p{L}", "the pattern is those four characters")
+
+@test("an astral literal in a pattern matches, which is the CESU-8 re-encoding doing its work")
+an_astral_literal_in_the_pattern()
+    // Without `u`, ECMAScript reads the pattern as UTF-16, so the literal is a surrogate pair. A
+    // pattern handed to libregexp as plain UTF-8 would be one code point, which no subject in that
+    // mode can produce, and the match would silently fail.
+    assert_eq(ok(re("😀", "").find("hi 😀")).span(0).unwrap(), (usize(3), usize(7)))
+    assert_eq(ok(re("😀", "u").find("hi 😀")).span(0).unwrap(), (usize(3), usize(7)))
+    assert_eq(ok(re("a😀b", "").find("xa😀b")).text(), "a😀b")
+
+@test("the word class under u skips an astral character, matching node")
+word_class_over_astral()
+    val ms = re("\\w+", "gu").find_all("a😀b").expect("ran")
+
+    assert_eq(ms.len(), usize(2))
+    assert_eq(ms.at(0).span(0).unwrap(), (usize(0), usize(1)))
+    assert_eq(ms.at(1).span(0).unwrap(), (usize(5), usize(6)))
+
+@test("the v flag compiles set notation, which u alone refuses")
+the_v_flag()
+    val r = re("[[a-z]--[aeiou]]", "v")
+
+    assert_eq(ok(r.find("hello")).text(), "h")
+    assert(compile("[[a-z]--[aeiou]]", "u").is_err(), "u has no set notation")
+
+@test("one prepared subject serves many matches, and answers what a fresh one would")
+a_prepared_subject_is_reusable()
+    val s = subject("aéébüñ é")
+    val r = re("é", "")
+
+    val first = r.exec(s, 0).expect("ran").expect("matched")
+    val second = r.exec(s, first.end()).expect("ran").expect("matched")
+    val third = r.exec(s, second.end()).expect("ran").expect("matched")
+
+    assert_eq(first.start(), usize(1))
+    assert_eq(second.start(), usize(3))
+    assert_eq(third.start(), usize(11), "past the space, which node also reports at byte 11")
+    assert(r.exec(s, third.end()).expect("ran").is_none())
+
+// -- The budget --------------------------------------------------------------------------------
+
+@test("a pathological pattern gives up instead of running, and the same one finishes unbounded")
+the_budget_stops_a_pathological_pattern()
+    val subj = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+
+    // Thirty a's and a b. With a budget this is an error; the point of the second half is that the
+    // pattern and the subject are each perfectly legal.
+    val bounded = compile_with("(a+)+$", no_flags(), Budget(1, 0)).expect("the pattern compiled")
+
+    assert_eq(bounded.find(subj).unwrap_err(), GaveUp)
+
+    val short = compile_with("(a+)+$", no_flags(), Budget(1, 0)).expect("the pattern compiled")
+
+    assert(short.find("aaab").is_ok(), "a short subject finishes inside the same budget")
+
+@test("the default budget is enough for ordinary patterns and not enough for the standard attack")
+the_default_budget()
+    assert(re("(a+)+$", "").find("aaaaaaaaaab").is_ok(), "ten a's is nothing")
+    assert_eq(re("(a+)+$", "").find("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab").unwrap_err(), GaveUp)
+
+    // Everything else in this file runs under the default budget, so a budget set too low would
+    // have reddened the whole suite rather than this test.
+    assert(re("\\w+@\\w+\\.\\w+", "").is_match("ed@example.com").expect("ran"))
+
+@test("a pattern nested deeper than the parser is allowed is refused rather than crashing")
+the_stack_budget()
+    var b = str_builder()
+
+    for i in 0..<2000
+        b.push("(?:")
+
+    b.push("a")
+
+    for i in 0..<2000
+        b.push(")")
+
+    val deep = b.finish()
+
+    assert_eq(compile_with(deep, no_flags(), Budget(-1, 16384)).unwrap_err(), TooDeep)
+    assert(compile_with("(?:(?:(?:a)))", no_flags(), Budget(-1, 16384)).is_ok(), "shallow is fine")
+
+// -- Compile errors ----------------------------------------------------------------------------
+
+@test("a pattern that is not one is refused, with libregexp's own words for why")
+compile_errors()
+    compile("a(b", "") match
+        Err(Pattern(m)) -> assert(m.len > 0, "libregexp said something")
+        _ -> assert(false, "an unbalanced parenthesis is not a pattern")
+
+    assert(compile("a{2,1}", "").is_err(), "a reversed bound is not a quantifier")
+    assert(compile("[z-a]", "").is_err(), "a reversed range is not a class")
+    assert(compile("*a", "").is_err(), "a quantifier needs something to quantify")
+    assert(compile("\\", "").is_err(), "a trailing backslash is not an escape")
+    assert(compile("(?<a>x)(?<a>y)", "").is_err(), "a group name may not be reused")
+    assert(compile("a**", "").is_err(), "a quantifier may not be quantified")
+
+@test("describe turns every error into a sentence, so a program can report without branching")
+describing_an_error()
+    assert(describe(GaveUp).len > 0)
+    assert(describe(Pattern("nope")).len > 0)
+    assert(describe(TooDeep).len > 0)
+    assert(describe(TooLong).len > 0)
+    assert(describe(OutOfMemory).len > 0)
+    assert(describe(Corrupt).len > 0)
+
+// -- Finding, splitting, replacing ---------------------------------------------------------------
+
+@test("find_all walks left to right without overlapping, and find_at does not shorten the subject")
+finding()
+    val ms = re("\\d+", "g").find_all("a1bb22ccc333").expect("ran")
+
+    assert_eq(ms.len(), usize(3))
+    assert_eq(ms.at(2).span(0).unwrap(), (usize(9), usize(12)))
+
+    // `^` still speaks about the whole subject even when the search starts past it, which is what
+    // separates a starting offset from a shortened string.
+    assert(re("^b", "").find_at("ab", 1).expect("ran").is_none())
+    assert_eq(ok(re("b", "").find_at("ab", 1)).start(), usize(1))
+
+@test("split leaves the pieces between the matches, including the empty ones")
+splitting()
+    val parts = re(",", "").split("a,b,,c").expect("ran")
+
+    assert_eq(parts.len(), usize(4))
+    assert_eq(parts.at(0), "a")
+    assert_eq(parts.at(2), "", "two commas leave an empty piece between them")
+    assert_eq(parts.at(3), "c")
+
+    val trimmed = re("\\s*,\\s*", "").split("a , b,c").expect("ran")
+
+    assert_eq(trimmed.len(), usize(3))
+    assert_eq(trimmed.at(1), "b")
+
+@test("replace touches the first match and replace_all every one")
+replacing()
+    assert_eq(re("b", "").replace("abcb", "[$&]").expect("ran"), "a[b]cb")
+    assert_eq(re("b", "").replace_all("abcb", "[$&]").expect("ran"), "a[b]c[b]")
+    assert_eq(re("(\\w+)@(\\w+)", "").replace("ed@example", "$2/$1").expect("ran"), "example/ed")
+
+@test("replace_all over a pattern that can match nothing reproduces node's output exactly")
+replacing_with_empty_matches()
+    assert_eq(re("a*", "").replace_all("baaac", "-").expect("ran"), "-b--c-")
+    assert_eq(re("", "").replace_all("abc", "-").expect("ran"), "-a-b-c-")
+
+// -- GetSubstitution -----------------------------------------------------------------------------
+
+@test("every dollar form of a replacement means what ECMAScript says it means")
+get_substitution()
+    val two = re("(a)(b)", "")
+    val named = re("(?<w>\\w+)", "")
+
+    assert_eq(re("b", "").replace("abcb", "$$").expect("ran"), "a$cb", "$$ is one dollar")
+    assert_eq(re("b", "").replace("abcb", "<$`|$'>").expect("ran"), "a<a|cb>cb", "before and after")
+    assert_eq(named.replace("hi", "[$<w>]").expect("ran"), "[hi]")
+    assert_eq(named.replace("hi", "[$<nope>]").expect("ran"), "[]", "an unknown name is empty")
+    assert_eq(re("(\\w)", "").replace("hi", "[$<w>]").expect("ran"), "[$<w>]i",
+              "with no named groups at all, $< is literal")
+    assert_eq(re("(a)|(b)", "").replace("b", "[$1][$2]").expect("ran"), "[][b]",
+              "a group that took no part contributes nothing")
+
+@test("a group number that the pattern does not have is literal, and $12 prefers the two-digit read")
+get_substitution_group_numbers()
+    val two = re("(a)(b)", "")
+    val twelve = re("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)", "")
+
+    assert_eq(two.replace("ab", "$3").expect("ran"), "$3", "there is no group 3")
+    assert_eq(two.replace("ab", "$0").expect("ran"), "$0", "and no group 0 in a replacement")
+    assert_eq(two.replace("ab", "$12").expect("ran"), "a2", "group 1, then a literal 2")
+    assert_eq(twelve.replace("abcdefghijkl", "$12|$1|").expect("ran"), "l|a|", "here 12 is a group")
+    assert_eq(re("x", "").replace("x", "$").expect("ran"), "$", "a trailing dollar is literal")
+    assert_eq(re("x", "").replace("x", "$z").expect("ran"), "$z")
+
+@test("expand answers the same text replace would have written, on its own")
+expanding_on_its_own()
+    val r = re("(?<a>\\w+)-(?<b>\\w+)", "")
+    val m = ok(r.find("left-right"))
+
+    assert_eq(expand(m, r, "$<b> $<a> $&"), "right left left-right")
+    assert_eq(expand(m, r, "$2/$1"), "right/left")
+
+@test("a replacement holding multi-byte text is copied a character at a time, never split")
+replacement_text_is_not_split()
+    assert_eq(re("x", "g").replace_all("axbxc", "é😀").expect("ran"), "aé😀bé😀c")
+    assert_eq(re("é", "").replace("aéb", "[$&]").expect("ran"), "a[é]b")
+
+// -- The surface a consumer walks ------------------------------------------------------------------
+
+@test("is_match answers the common question without building a match")
+is_match_is_the_cheap_question()
+    val r = re("^\\d{4}-\\d{2}-\\d{2}$", "")
+
+    assert(r.is_match("2026-09-19").expect("ran"))
+    assert(!r.is_match("19/09/2026").expect("ran"))
+
+@test("source and flags come back as they went in, which is what a program logs")
+source_and_flags_survive()
+    val r = re("a(b)c", "gi")
+
+    assert_eq(r.source, "a(b)c")
+    assert_eq(r.flags().text(), "gi")
+    assert_eq(r.group_count(), usize(1))

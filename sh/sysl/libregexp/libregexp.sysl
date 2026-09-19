@@ -1,0 +1,875 @@
+module sh.sysl.libregexp
+
+import sh.sysl.libregexp.c
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.{Ascii, StrBuilder, char_indices, chars_of, from_utf8, is_char_boundary, str_builder}
+import sysl.buf.{Buf, buf, buf_with_capacity}
+
+/** ECMAScript regular expressions for sysl, over the engine QuickJS uses -- carried here, so there
+ * is nothing to install and nothing for a target to be missing.
+ *
+ * **This is the third regex in the organisation, and the three differ by dialect and by where they
+ * run.** `sysl.regex` in the standard library is a Pike VM over POSIX extended syntax: linear time,
+ * nothing that can explode, and no `\d`, no lazy quantifier, no lookaround, no backreference.
+ * `sh.sysl.pcre2` is Perl's syntax through an installed PCRE2. This one is **JavaScript's** syntax,
+ * to the letter -- it is the engine a JavaScript program's regular expressions actually run on --
+ * and it is the only one of the three that reaches a board or a `wasm32-wasi` build, because its
+ * implementation is in this repository rather than on the machine.
+ *
+ *     import sh.sysl.libregexp.{compile, describe}
+ *
+ *     main() -> Result[unit, string]
+ *         val re = compile("(?<user>\\w+)@(?<host>[\\w.]+)", "g").map_err(describe)?
+ *
+ *         for m in re.find_all("ed@example.com and sam@example.org").map_err(describe)?.view()
+ *             print(m.group_named("user").unwrap(), m.group_named("host").unwrap())
+ *
+ * ## Positions are byte offsets
+ *
+ * Every offset this module reports -- a match's start and end, a group's span, the `from` an `exec`
+ * takes -- is a **byte** offset into the UTF-8 `string` that was searched, and always on a character
+ * boundary, so `s[a..<b]` takes one without a boundary check failing. That is not what JavaScript
+ * reports: a JavaScript index counts UTF-16 code units. A consumer that owes its own users character
+ * or code-unit positions converts, and `sysl.text.char_indices` is the walk that does it.
+ *
+ * ## What `u` changes, and why it is not the default
+ *
+ * Without `u`, ECMAScript matches over UTF-16 code units: an astral character such as `\u{1F600}` is
+ * **two** characters, `.` matches one half of it, and `[\u{1F600}]` is a class of two surrogates.
+ * With `u` it is one character, `.` matches the whole of it, `\u{...}` is a code-point escape, and
+ * `\p{...}` becomes available. This package follows ECMAScript exactly and does not quietly turn `u`
+ * on, because a pattern written for the one dialect can mean something different in the other.
+ *
+ * **What it does do is keep every reported offset on a character boundary in both modes.** The one
+ * place that shows is a match whose edge falls *between* the halves of a surrogate pair -- possible
+ * only without `u` -- where the offset reported is the start of that character, since the middle of
+ * a UTF-8 character is not a position a `string` has.
+ *
+ * ## Backtracking, and the budget that bounds it
+ *
+ * ECMAScript regular expressions backtrack, so a pattern can be made to run for a very long time on
+ * a short subject: `(a+)+$` against thirty `a`s and a `b` is the standard demonstration, and in a
+ * server it is a denial of service. Every match here therefore runs under a **step budget**, and an
+ * overrun is `GaveUp` rather than a process that stops answering.
+ *
+ * The budget counts *steps*, not milliseconds, because a clock is not available everywhere this
+ * package claims to run and because a step count is reproducible -- the same pattern and subject
+ * give up in the same place every time, so a test can pin it.
+ */
+
+// ## What can go wrong
+
+/** A pattern that would not compile, or a match that would not finish. */
+enum Error
+    /** The pattern is not one, in libregexp's own words.
+     *
+     * **There is no offset, and that is upstream's limit rather than a choice here.** `lre_compile`
+     * writes a sentence into a caller's buffer and reports nothing about where it stopped, where
+     * PCRE2 hands back an offset into the pattern. A consumer that wants to point at the character
+     * has only the message.
+     */
+    Pattern(message: string)
+
+    /** The match used its whole budget. The pattern and the subject are each legal; the combination
+     * is what costs. See `Budget` and `compile_with`.
+     */
+    GaveUp
+
+    /** The pattern parser ran out of the C stack it was allowed. A pattern nested thousands deep
+     * does this; ordinary ones never come near it.
+     */
+    TooDeep
+
+    /** libregexp could not allocate. */
+    OutOfMemory
+
+    /** The bytecode the matcher was handed is not bytecode. Unreachable through this module's
+     * surface -- it is here because `lre_exec` can say it.
+     */
+    Corrupt
+
+    /** The subject is longer than libregexp can address. `lre_exec` counts code units in an `int`,
+     * so a subject over two gigabytes has no answer rather than a wrong one.
+     */
+    TooLong
+end Error
+
+/** Two errors are the same error when they are the same arm, and for `Pattern` when libregexp said
+ * the same thing. It is here because a consumer branching on `GaveUp` should be able to write `==`,
+ * and because an enum carrying a payload does not get one for free.
+ */
+impl Eq for Error
+    eq(self, rhs: Self) -> bool = (self, rhs) match
+        (Pattern(a), Pattern(b)) -> a == b
+        (GaveUp, GaveUp) -> true
+        (TooDeep, TooDeep) -> true
+        (OutOfMemory, OutOfMemory) -> true
+        (Corrupt, Corrupt) -> true
+        (TooLong, TooLong) -> true
+        _ -> false
+
+/** The rendering, so that a refusal can be printed without matching on it. */
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(describe(self), out, fmt)
+
+/** An `Error` as a sentence, for a program that reports rather than branches. */
+describe(e: Error) -> string = e match
+    Pattern(m) -> "the pattern is not one: " + m
+    GaveUp -> "the match used its whole budget"
+    TooDeep -> "the pattern nests deeper than the parser was allowed"
+    OutOfMemory -> "out of memory"
+    Corrupt -> "the compiled pattern is not bytecode"
+    TooLong -> "the subject is too long to match over"
+
+// ## Flags
+
+/** The seven ECMAScript flags, held the way libregexp holds them.
+ *
+ * They are written as a string, exactly as they are in JavaScript -- `compile(p, "gi")` -- and
+ * `parse_flags` is what a program calls when the letters arrive at run time and may be wrong.
+ *
+ * | letter | what it does |
+ * |---|---|
+ * | `g` | global: recorded, and what `find_all` means |
+ * | `i` | ignore case |
+ * | `m` | multiline: `^` and `$` match at a line break |
+ * | `s` | dotAll: `.` matches a line break too |
+ * | `u` | unicode: one astral character is one character, `\p{...}` and `\u{...}` become available |
+ * | `y` | sticky: the match must begin exactly where the search did |
+ * | `d` | indices: recorded only -- this module reports spans for every group whether or not it is set |
+ * | `v` | unicode sets: `u` plus set notation inside a class, `[[a-z]--[aeiou]]` |
+ *
+ * `u` and `v` are mutually exclusive, as they are in JavaScript.
+ */
+struct Flags
+    bits: i32
+
+    global(self) -> bool = (self.bits & c.FLAG_GLOBAL) != 0
+    ignore_case(self) -> bool = (self.bits & c.FLAG_IGNORECASE) != 0
+    multiline(self) -> bool = (self.bits & c.FLAG_MULTILINE) != 0
+    dot_all(self) -> bool = (self.bits & c.FLAG_DOTALL) != 0
+    unicode(self) -> bool = (self.bits & c.FLAG_UNICODE) != 0
+    sticky(self) -> bool = (self.bits & c.FLAG_STICKY) != 0
+    indices(self) -> bool = (self.bits & c.FLAG_INDICES) != 0
+    unicode_sets(self) -> bool = (self.bits & c.FLAG_UNICODE_SETS) != 0
+
+    /** Whether the pattern is matched a code point at a time, which `u` and `v` both mean. It is the
+     * question the rest of this module asks, rather than either flag on its own.
+     */
+    code_points(self) -> bool = self.unicode() || self.unicode_sets()
+
+    /** The letters back again, in the order JavaScript's own `RegExp.prototype.flags` produces. */
+    text(self) -> string
+        var b = str_builder()
+
+        if self.indices() then b.push("d")
+        if self.global() then b.push("g")
+        if self.ignore_case() then b.push("i")
+        if self.multiline() then b.push("m")
+        if self.dot_all() then b.push("s")
+        if self.unicode() then b.push("u")
+        if self.unicode_sets() then b.push("v")
+        if self.sticky() then b.push("y")
+
+        b.finish()
+    end text
+end Flags
+
+/** No flags at all. */
+no_flags() -> Flags = Flags(0)
+
+/** The letters, read as JavaScript reads them. A letter that is not a flag, or one given twice, is a
+ * `Pattern` error -- which is what `new RegExp(p, "gg")` throws.
+ */
+parse_flags(s: string) -> Result[Flags, Error]
+    var bits: i32 = 0
+
+    for c0 in chars_of(s.bytes)
+        val bit = c0.code() match
+            100 -> c.FLAG_INDICES
+            103 -> c.FLAG_GLOBAL
+            105 -> c.FLAG_IGNORECASE
+            109 -> c.FLAG_MULTILINE
+            115 -> c.FLAG_DOTALL
+            117 -> c.FLAG_UNICODE
+            118 -> c.FLAG_UNICODE_SETS
+            121 -> c.FLAG_STICKY
+            _ -> 0
+
+        if bit == 0 then return Err(Pattern("'" + string(c0) + "' is not a regular expression flag"))
+        if (bits & bit) != 0 then return Err(Pattern("the flag '" + string(c0) + "' is given twice"))
+
+        bits = bits | bit
+
+    if (bits & c.FLAG_UNICODE) != 0 && (bits & c.FLAG_UNICODE_SETS) != 0
+        return Err(Pattern("'u' and 'v' cannot both be set"))
+
+    Ok(Flags(bits))
+end parse_flags
+
+// ## The budget
+
+/** What a match is allowed to spend before it gives up.
+ *
+ * **`steps` is in units of ten thousand backtracking steps**, which is how often libregexp reaches
+ * its interrupt hook; a budget of 1000 is therefore about ten million steps. The default is
+ * `default_budget()`, which is generous enough that no ordinary pattern comes near it and small
+ * enough that `(a+)+$` on thirty characters answers in well under a second.
+ *
+ * `stack_bytes` bounds the *pattern parser*, which is the only part of libregexp that recurses on
+ * the C stack; matching keeps its backtracking stack on the heap and is bounded by `steps` alone.
+ */
+struct Budget
+    steps: i64
+    stack_bytes: i64
+end Budget
+
+/** Enough for any pattern a person writes, and not enough for a pattern designed to hurt. */
+default_budget() -> Budget = Budget(1000, 4 * 1024 * 1024)
+
+/** No bound at all, which is what a JavaScript engine gives you. It is here for a program matching
+ * only patterns it wrote itself, and it is the wrong answer for anything that matches a pattern or a
+ * subject that came from outside.
+ */
+unlimited_budget() -> Budget = Budget(-1, 0)
+
+// ## A prepared subject
+
+/** A subject converted once, so that a walk over it does not convert it again for every match.
+ *
+ * **libregexp does not take UTF-8.** It matches over an 8-bit Latin-1 buffer or over UTF-16, and a
+ * sysl `string` is neither. So a subject arrives here first:
+ *
+ *   - **A pure-ASCII subject is handed over as it stands**, as the 8-bit buffer, and every offset
+ *     libregexp reports is already a byte offset. That is the common case and it costs one pass to
+ *     confirm and nothing else.
+ *   - **Anything else is converted to UTF-16 once**, with a table beside it saying which byte each
+ *     code unit came from, so an offset can be read back. The conversion costs six bytes per code
+ *     unit and is kept for as long as the `Subject` is, which is what makes `find_all` one
+ *     conversion rather than one per match.
+ *
+ * A program matching several patterns against one text builds the `Subject` itself and passes it to
+ * each; `find`, `find_all` and the rest build one internally for the single-shot case.
+ */
+struct Subject
+    src: string
+
+    /** The UTF-16 code units, empty when `ascii` is true. */
+    units: &Buf[u16]
+
+    /** `starts[i]` is the byte offset in `src` of the character that produced code unit `i`, and
+     * `starts[units.len]` is `src.len`. Both halves of a surrogate pair name the same byte, which is
+     * what keeps every reported offset on a character boundary.
+     */
+    starts: &Buf[u32]
+
+    ascii: bool
+
+    /** How many code units libregexp is matching over: bytes for an ASCII subject, UTF-16 units
+     * otherwise.
+     */
+    units_len(&self) -> usize = if self.ascii then self.src.bytes.len else self.units.len()
+
+    /** The byte offset a code-unit index stands for.
+     *
+     * **A boundary that fell between the halves of a surrogate pair is rounded outward**, so a
+     * reported span always covers whole characters: a start rounds down to where the character
+     * begins, an end rounds up to where it ends. That case arises only without `u`, where
+     * ECMAScript lets `.` match one half of an astral character, and the alternative would be a span
+     * whose two ends are the same byte -- an empty match where the engine found a real one.
+     */
+    private byte_of(&self, i: usize, is_end: bool) -> usize
+        if self.ascii then return i
+
+        val here = usize(self.starts.at(i))
+
+        // The second unit of a pair is the one whose character started at the unit before it.
+        if is_end && i > 0 && i < self.starts.len() - 1 && usize(self.starts.at(i - 1)) == here
+            usize(self.starts.at(i + 1))
+        else
+            here
+    end byte_of
+
+    /** The code-unit index a byte offset stands for, by binary search over `starts` -- which is
+     * non-decreasing, so the first entry at or past the byte is the one wanted.
+     */
+    private unit_of(&self, b: usize) -> usize
+        if self.ascii then return b
+
+        var lo: usize = 0
+        var hi = self.starts.len()
+
+        while lo < hi
+            val mid = lo + (hi - lo) / 2
+
+            if usize(self.starts.at(mid)) < b then lo = mid + 1 else hi = mid
+
+        lo
+    end unit_of
+end Subject
+
+/** Prepare a subject for matching. */
+subject(s: string) -> &Subject
+    val b = s.bytes
+    var plain = true
+
+    for i in 0..<b.len
+        if b[i] >= u8(128)
+            plain = false
+            break
+
+    if plain then return Subject(s, buf(), buf(), true)
+
+    // One UTF-16 code unit per BMP character and two per astral one, so the subject's character
+    // count is a lower bound and its byte length an upper one.
+    var units: &Buf[u16] = buf_with_capacity(b.len, u16(0))
+    var starts: &Buf[u32] = buf_with_capacity(b.len + 1, u32(0))
+
+    for (at, ch) in char_indices(b)
+        val u = ch.code()
+
+        if u < 65536
+            units.push(u16(u))
+            starts.push(u32(at))
+        else
+            val v = u - 65536
+
+            units.push(u16(55296 + (v >> 10)))
+            units.push(u16(56320 + (v & 1023)))
+            starts.push(u32(at))
+            starts.push(u32(at))
+
+    starts.push(u32(b.len))
+    Subject(s, units, starts, false)
+end subject
+
+// ## A match
+
+/** Where a match landed, and what its groups took.
+ *
+ * The spans are **byte offsets into the subject**, always on a character boundary. A group that took
+ * no part in the match has no span rather than an empty one at some arbitrary place: `(a)|(b)`
+ * against `"b"` leaves group 1 absent, and there is a real difference between that and a group that
+ * matched the empty string, which `(a*)b` against `"b"` is.
+ */
+struct Match
+    src: string
+    slots: []int
+
+    /** How many groups this match reports, group 0 -- the whole match -- included. So a pattern with
+     * two capture groups answers 3, whether or not both took part, and it is the same number for
+     * every match of one pattern.
+     */
+    group_count(self) -> usize = self.slots.len / 2
+
+    span(self, i: usize) -> Option[(usize, usize)]
+        if i >= self.group_count() then return None
+
+        val lo = self.slots[i * 2]
+        val hi = self.slots[i * 2 + 1]
+
+        if lo < 0 || hi < 0 then None else Some((usize(lo), usize(hi)))
+    end span
+
+    group(self, i: usize) -> Option[string] = self.span(i) match
+        Some(s) -> Some(self.src[s.0..<s.1])
+        None -> None
+
+    /** The whole match. Group 0 always took part -- there would be no `Match` otherwise -- so this is
+     * the one place the `Option` is worth unwrapping on the caller's behalf.
+     */
+    text(self) -> string = self.group(0).unwrap()
+
+    start(self) -> usize = usize(self.slots[0])
+
+    end(self) -> usize = usize(self.slots[1])
+
+    /** Whether this match consumed anything. It is the question the walking rules turn on, and it is
+     * not the same as "did it end where the search began".
+     */
+    is_empty(self) -> bool = self.end() == self.start()
+end Match
+
+/** A `(?<name>...)` group, and the number it answers to. */
+struct NamedGroup
+    name: string
+    number: usize
+end NamedGroup
+
+// ## A compiled pattern
+
+/** **The handle is a bytecode buffer libregexp allocated, and this is a `&Regex` with a destructor**
+ * -- so nothing has to be released by hand and there is no way to forget.
+ *
+ * Compiling is separated from matching because it is the expensive half and a pattern is usually
+ * used more than once. A program matching in a loop compiles once outside it.
+ */
+struct Regex
+    /** The pattern as it was written, which is JavaScript's `RegExp.prototype.source`. */
+    source: string
+
+    bc: *u8
+    groups: usize
+    budget: Budget
+
+    flags(&self) -> Flags = Flags(c.flags_of(self.bc))
+
+    /** How many capture groups the pattern has, not counting the whole match. */
+    group_count(&self) -> usize = self.groups
+
+    /** Whether the pattern declared any `(?<name>...)` group at all.
+     *
+     * **It is not the same question as "is this name a group here", and the difference is visible**:
+     * ECMAScript's `GetSubstitution` leaves `$<` literal when the pattern has no named groups and
+     * substitutes the empty string when it has some but not this one. So a `$<w>` against `(\w)`
+     * comes out as the four characters `$<w>`, and against `(?<x>\w)` it comes out as nothing.
+     */
+    has_named_groups(&self) -> bool = c.groupnames(self.bc) != null
+
+    /** Every `(?<name>...)` the pattern declared, with the number that group was given.
+     *
+     * **Read out of the compiled bytecode rather than remembered here**, so the names come from the
+     * thing that parsed the pattern. libregexp lays them out as one name per group from 1 upwards --
+     * an unnamed group contributing an empty one -- each followed by a NUL *and one reserved byte*,
+     * which is why the stride is `LRE_GROUP_NAME_TRAILER_LEN` and not one.
+     */
+    named_groups(&self) -> &Buf[NamedGroup]
+        var out: &Buf[NamedGroup] = buf()
+        val p = c.groupnames(self.bc)
+
+        if p == null then return out
+
+        var at: usize = 0
+
+        for i in 1..<(self.groups + 1)
+            var n: usize = 0
+
+            while p[at + n] != u8(0)
+                n += 1
+
+            if n > 0
+                from_utf8(p[at..<(at + n)]) match
+                    Ok(name) -> out.push(NamedGroup(name, i))
+                    Err(_) -> ()
+
+            at += n + c.GROUP_NAME_TRAILER_LEN
+
+        out
+    end named_groups
+
+    /** The number a `(?<name>...)` group was given, for reading it out of a `Match`. */
+    group_named(&self, name: string) -> Option[usize]
+        val gs = self.named_groups()
+
+        for i in 0..<gs.len()
+            val g = gs.at(i)
+
+            if g.name == name then return Some(g.number)
+
+        None
+    end group_named
+
+    // ### Matching
+
+    /** Whether the subject matches anywhere, which is the common question. */
+    is_match(&self, s: string) -> Result[bool, Error] = self.find(s).map((m) -> m.is_some())
+
+    /** The leftmost match, or nothing. */
+    find(&self, s: string) -> Result[Option[Match], Error] = self.exec(subject(s), 0)
+
+    /** The leftmost match at or after a byte offset. **The offset does not shorten the subject** --
+     * `^`, `$` and lookbehind still speak about the whole of it -- so walking a text with this gives
+     * the same answers one pass over it would.
+     *
+     * A sticky (`y`) pattern must match *exactly* at the offset, which is what makes this the
+     * `lastIndex` loop a JavaScript program writes.
+     */
+    find_at(&self, s: string, from: usize) -> Result[Option[Match], Error] = self.exec(subject(s), from)
+
+    /** The same, over a subject that has already been prepared. This is the one to call in a loop:
+     * the UTF-16 conversion a non-ASCII subject needs happens when the `Subject` is built and not
+     * again.
+     */
+    exec(&self, subj: &Subject, from: usize) -> Result[Option[Match], Error]
+        val src = subj.src
+        val n = subj.units_len()
+
+        if n > 2147483647 then return Err(TooLong)
+        if from > src.bytes.len then return Ok(None)
+
+        val at = subj.unit_of(from)
+        val shift = if subj.ascii then 0 else 1
+
+        // The capture array is sized by `alloc_count`, not by the group count: libregexp writes its
+        // backreference registers into the same block, past the group slots.
+        var caps: []*u8 = [null; usize(c.alloc_count(self.bc))]
+
+        var b = c.Budget(self.budget.steps, self.budget.stack_bytes, 0, 0, isize(0))
+
+        // An empty subject is a legal subject, and `as_ptr` of an empty slice is null -- which
+        // libregexp dereferences. One byte this frame owns stands in for it; `clen` is zero, so
+        // nothing is read through it.
+        var pad: []u8 = [u8(0); 1]
+
+        val base: *u8 =
+            if n == 0 then
+                as_mut_ptr(pad)
+            elif subj.ascii then
+                as_ptr(src.bytes)
+            else
+                ptr_cast(as_ptr(subj.units.view()))
+        val rc = c.exec(as_mut_ptr(caps), self.bc, base, i32(at), i32(n), i32(shift), &b)
+
+        // **`GaveUp` and not `TooDeep`, unconditionally.** libregexp reaches its stack check only in
+        // the pattern *parser*; the matcher's backtracking stack is heap, so a match that stops
+        // early has always stopped on the step budget. A branch on `hit_stack` here would be dead
+        // code wearing the shape of resource management -- the mutation pass found it by removing
+        // the branch and watching nothing go red.
+        if rc == c.RET_TIMEOUT then return Err(GaveUp)
+        if rc == c.RET_MEMORY_ERROR then return Err(OutOfMemory)
+        if rc < 0 then return Err(Corrupt)
+        if rc == 0 then return Ok(None)
+
+        val pairs = self.groups + 1
+        var slots: []int = [-1; pairs * 2]
+
+        for i in 0..<(pairs * 2)
+            val p = caps[i]
+
+            if p != null
+                slots[i] = int(subj.byte_of((usize(p) - usize(base)) >> shift, i % 2 == 1))
+
+        Ok(Some(Match(src, slots)))
+    end exec
+
+    /** Every match, left to right and non-overlapping.
+     *
+     * The next search starts where the last match ended, except after an **empty** match, which
+     * would otherwise be found again forever at the same place; there the search resumes one
+     * character on. That is ECMAScript's rule for a global regular expression, and it is why the
+     * pattern `$` finds exactly one match in `"abc"` and the pattern `a*` finds four in `"baaac"`.
+     *
+     * **The advance is one whole character in both modes.** ECMAScript's `AdvanceStringIndex`
+     * advances a code *unit* without `u` and a code *point* with it; here the positions are byte
+     * offsets into UTF-8, where the middle of a character is not a position, so the walk always
+     * advances the character. The two differ only for an empty match inside an astral character
+     * without `u`.
+     */
+    find_all(&self, s: string) -> Result[&Buf[Match], Error]
+        var out: &Buf[Match] = buf()
+        val subj = subject(s)
+        val src = s.bytes
+        var at: usize = 0
+        var going = true
+
+        while going
+            self.exec(subj, at)? match
+                None -> going = false
+                Some(m) ->
+                    out.push(m)
+
+                    // **The test is whether the MATCH is empty, not whether it ended ahead of the
+                    // cursor.** An unanchored search often finds an empty match some way past where
+                    // it began -- `/$/` from 0 answers [3, 3] on a three-byte subject -- and calling
+                    // that progress resumes at 3, which is exactly where the empty match is, so the
+                    // next search finds it again.
+                    at = advance(src, m, at)
+
+                    if at > src.len then going = false
+
+        Ok(out)
+    end find_all
+
+    /** The pieces between the matches. A pattern that matches the empty string splits between every
+     * character, which is the same rule `find_all` follows and the reason both are written in terms
+     * of it.
+     */
+    split(&self, s: string) -> Result[&Buf[string], Error]
+        var out: &Buf[string] = buf()
+        var at: usize = 0
+        val ms = self.find_all(s)?
+
+        for i in 0..<ms.len()
+            val m = ms.at(i)
+
+            out.push(s[at..<m.start()])
+            at = m.end()
+
+        out.push(s[at..<s.len])
+        Ok(out)
+    end split
+
+    // ### Replacing
+
+    /** The leftmost match replaced, and the rest of the subject left alone. The replacement text is
+     * not a pattern, but it may name what the match found -- see `expand`.
+     */
+    replace(&self, s: string, with: string) -> Result[string, Error] = self.replace_by(s, with, false)
+
+    /** Every match replaced, which is what a JavaScript `String.prototype.replace` with a `g`
+     * pattern does. The flag is not read here: a caller asking for every match gets every match.
+     */
+    replace_all(&self, s: string, with: string) -> Result[string, Error] = self.replace_by(s, with, true)
+
+    private replace_by(&self, s: string, with: string, all: bool) -> Result[string, Error]
+        var out = str_builder()
+        val subj = subject(s)
+        val src = s.bytes
+        var at: usize = 0
+        var going = true
+
+        while going
+            self.exec(subj, at)? match
+                None -> going = false
+                Some(m) ->
+                    out.push(s[at..<m.start()])
+                    expand_into(&out, m, self, with)
+
+                    val next = advance(src, m, at)
+
+                    // An empty match leaves the character it stepped over in the output; a
+                    // non-empty one has just been replaced, so nothing between the two is owed.
+                    if m.is_empty() && next <= src.len then out.push(s[m.end()..<min(next, src.len)])
+
+                    at = next
+                    if !all || at > src.len then going = false
+
+        if at <= src.len then out.push(s[min(at, src.len)..<src.len])
+        Ok(out.finish())
+    end replace_by
+end Regex
+
+/** The bytecode, given back to the allocator libregexp took it from. */
+impl Drop for Regex
+    drop(self)
+        c.free_bytecode(self.bc)
+    end drop
+
+// ## Compiling
+
+/** A compiled pattern, read as JavaScript reads it, with the flags written as JavaScript writes them
+ * -- `""`, `"g"`, `"gimsu"`.
+ */
+compile(pattern: string, flags: string) -> Result[&Regex, Error] =
+    compile_with(pattern, parse_flags(flags)?, default_budget())
+
+/** The same, under a budget of the caller's choosing. */
+compile_with(pattern: string, fl: Flags, budget: Budget) -> Result[&Regex, Error]
+    // **A pattern that is not a `u` pattern is handed over as CESU-8**, which is what a JavaScript
+    // engine does and is not a detail that can be skipped. Without `u`, ECMAScript reads the pattern
+    // as UTF-16, so an astral literal in it is a surrogate *pair* -- two characters. Passing plain
+    // UTF-8 would make it one character, which no subject in that mode can ever produce, and the
+    // pattern would silently match nothing.
+    //
+    // The buffer is held in a local for as long as the call needs it: a `view()` into a `Buf` whose
+    // last reference has gone is storage that has been freed.
+    val needs = !fl.code_points() && has_astral(pattern)
+    val holder: &Buf[u8] = if needs then cesu8(pattern) else buf()
+    val p: []const u8 = if needs then holder.view() else pattern.bytes
+
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var b = c.Budget(budget.steps, budget.stack_bytes, 0, 0, isize(0))
+
+    // **An empty pattern is a legal pattern and a null pointer is not one.** `as_ptr` of an empty
+    // slice answers null, and libregexp reads its pattern through `buf_ptr` without checking it, so
+    // `compile("", "")` -- which ECMAScript accepts and which matches at every position -- would
+    // fault. One byte of storage this function owns is the whole of the fix.
+    var pad: []u8 = [u8(0); 1]
+    val start = if p.len == 0 then as_mut_ptr(pad) else as_ptr(p)
+
+    val bc = c.compile(&len, as_mut_ptr(msg), 128, start, p.len, fl.bits, &b)
+
+    if bc == null
+        if b.hit_stack != 0 then return Err(TooDeep)
+
+        var n: usize = 0
+
+        while n < 128 && msg[n] != u8(0)
+            n += 1
+
+        return from_utf8(msg[0..<n]) match
+            Ok(m) -> Err(Pattern(m))
+            Err(_) -> Err(Pattern("the pattern is not one"))
+
+    Ok(Regex(pattern, bc, usize(c.capture_count(bc)) - 1, budget))
+end compile_with
+
+// ## Replacement text
+
+/** ECMAScript's `GetSubstitution`, which is what the second argument of a `String.prototype.replace`
+ * means -- and pure string work, so it is available on its own for a program building the answer
+ * itself.
+ *
+ * | form | what it stands for |
+ * |---|---|
+ * | `$$` | one literal `$` |
+ * | `` $` `` | everything before the match |
+ * | `$&` | the match |
+ * | `$'` | everything after the match |
+ * | `$n`, `$nn` | group `n`, empty when that group took no part |
+ * | `$<name>` | the named group, empty when it took no part |
+ *
+ * **Anything else is literal**, including a `$` at the end of the text and a `$9` in a pattern with
+ * fewer than nine groups. That is the specification's rule and not a lenient reading of it: a
+ * replacement written for one pattern must not change meaning under another.
+ *
+ * `$nn` prefers the two-digit reading when that group exists and falls back to the one-digit reading
+ * when it does not, so `$12` is group 12 under a twelve-group pattern and group 1 followed by a `2`
+ * under a two-group one.
+ */
+expand(m: Match, re: &Regex, with: string) -> string
+    var out = str_builder()
+
+    expand_into(&out, m, re, with)
+    out.finish()
+end expand
+
+private expand_into(out: *StrBuilder, m: Match, re: &Regex, with: string)
+    val r = with.bytes
+    val n = r.len
+    var i: usize = 0
+
+    while i < n
+        if r[i] != u8(36) || i + 1 >= n
+            // Not a `$`, or a `$` with nothing after it: literal, and copied a whole character at a
+            // time so that a multi-byte character is never split.
+            val w = char_width(r, i)
+
+            out.push(with[i..<(i + w)])
+            i += w
+        else
+            val k = r[i + 1]
+
+            if k == u8(36)
+                out.push("$")
+                i += 2
+            elif k == u8(38)
+                out.push(m.text())
+                i += 2
+            elif k == u8(96)
+                out.push(m.src[0..<m.start()])
+                i += 2
+            elif k == u8(39)
+                out.push(m.src[m.end()..<m.src.len])
+                i += 2
+            elif k == u8(60)
+                // `$<name>`. With no `>` after it, or with no named groups in the pattern at all,
+                // the `$<` is literal -- both are the specification's rule.
+                var j = i + 2
+
+                while j < n && r[j] != u8(62)
+                    j += 1
+
+                if j >= n || !re.has_named_groups()
+                    out.push("$<")
+                    i += 2
+                else
+                    val name = with[(i + 2)..<j]
+
+                    re.group_named(name) match
+                        Some(g) -> out.push(m.group(g).unwrap_or(""))
+                        None -> ()
+
+                    i = j + 1
+            elif k >= u8(48) && k <= u8(57)
+                var g = usize(k) - 48
+                var used: usize = 2
+
+                if i + 2 < n && r[i + 2] >= u8(48) && r[i + 2] <= u8(57)
+                    val two = g * 10 + usize(r[i + 2]) - 48
+
+                    if two >= 1 && two <= re.groups
+                        g = two
+                        used = 3
+
+                if g >= 1 && g <= re.groups
+                    out.push(m.group(g).unwrap_or(""))
+                    i += used
+                else
+                    out.push("$")
+                    i += 1
+            else
+                out.push("$")
+                i += 1
+end expand_into
+
+// ## The small walks
+
+/** Where the next search begins after a match, and the reason every walk in this module ends.
+ *
+ * A non-empty match resumes at its end; an empty one resumes one character past it, which is
+ * ECMAScript's rule and what keeps the same empty match from being found for ever.
+ *
+ * **The last line is the guarantee rather than a defensive habit**: the cursor must be strictly
+ * greater than the one the search began at, or `find_all`, `split` and `replace_all` are loops with
+ * no exit. Both branches above already satisfy it -- an unanchored search cannot answer a match that
+ * begins before where it started -- so the fallback never fires today. It is here because the shape
+ * that makes it fire is a *silent hang*: when the empty-match advance was removed on purpose to
+ * check the suite could see it, the run did not go red, it stopped answering.
+ */
+private advance(src: []const u8, m: Match, at: usize) -> usize
+    val next = if m.is_empty() then next_boundary(src, m.end()) else m.end()
+
+    if next > at then next else next_boundary(src, at)
+end advance
+
+/** Where the next character starts, for stepping past an empty match. It reads the boundary out of
+ * the bytes rather than decoding, because all it needs to know is where a character begins and UTF-8
+ * says that in the top two bits of every byte.
+ */
+private next_boundary(src: []const u8, at: usize) -> usize
+    var k = at + 1
+
+    while k < src.len && !is_char_boundary(src[k])
+        k += 1
+
+    k
+end next_boundary
+
+/** How many bytes the character starting at `at` takes. */
+private char_width(src: []const u8, at: usize) -> usize = next_boundary(src, at) - at
+
+private min(a: usize, b: usize) -> usize = if a < b then a else b
+
+/** Whether the text holds a character outside the basic multilingual plane, which in UTF-8 is a byte
+ * of 0xF0 or above and nothing else. It is the cheap pass that keeps `cesu8` from allocating for the
+ * patterns -- nearly all of them -- that have nothing to convert.
+ */
+private has_astral(s: string) -> bool
+    val b = s.bytes
+
+    for i in 0..<b.len
+        if b[i] >= u8(240) then return true
+
+    false
+end has_astral
+
+/** The pattern re-encoded the way a JavaScript engine hands it to `lre_compile` when the pattern is
+ * not a `u` pattern: every astral character as its UTF-16 surrogate pair, each surrogate written as
+ * three bytes. That is CESU-8, and libregexp's decoder reads it because it does not reject
+ * surrogates.
+ */
+private cesu8(s: string) -> &Buf[u8]
+    val b = s.bytes
+    var out: &Buf[u8] = buf_with_capacity(b.len + 8, u8(0))
+
+    for (at, ch) in char_indices(b)
+        val u = ch.code()
+
+        if u < 65536
+            out.extend(b[at..<next_boundary(b, at)])
+        else
+            val v = u - 65536
+
+            push_surrogate(out, 55296 + (v >> 10))
+            push_surrogate(out, 56320 + (v & 1023))
+
+    out
+end cesu8
+
+private push_surrogate(out: &Buf[u8], u: u32)
+    out.push(u8(224 + (u >> 12)))
+    out.push(u8(128 + ((u >> 6) & 63)))
+    out.push(u8(128 + (u & 63)))
+end push_surrogate

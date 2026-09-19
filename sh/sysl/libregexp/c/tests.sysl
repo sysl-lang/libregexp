@@ -1,0 +1,154 @@
+module sh.sysl.libregexp.c
+@tests
+@include("glue.h")
+
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+// What the raw layer claims, checked against the C rather than against itself.
+//
+// **`Budget` is a sysl struct laid over a C one**, and that is the shape where a disagreement links
+// perfectly and corrupts a field at run time: a field added, a width changed, a reordering, and the
+// sysl side goes on writing where the old layout said. So the size and every offset are asked of the
+// C compiler here, and a change on either side fails a test instead.
+//
+// The rest drives the raw surface on the shortest cases that reach every call. It is here rather
+// than only in the module above because a defect in an `extern` -- a dropped argument, a wrong width
+// -- still compiles and still links, and the pleasant layer would report it as a matching bug.
+
+c const
+    BUDGET_SIZE:     usize = "sizeof(SyslLreBudget)"
+    BUDGET_ALIGN:    usize = "_Alignof(SyslLreBudget)"
+    OFF_TICKS:       usize = "offsetof(SyslLreBudget, ticks)"
+    OFF_STACK_BYTES: usize = "offsetof(SyslLreBudget, stack_bytes)"
+    OFF_GAVE_UP:     usize = "offsetof(SyslLreBudget, gave_up)"
+    OFF_HIT_STACK:   usize = "offsetof(SyslLreBudget, hit_stack)"
+    OFF_STACK_BASE:  usize = "offsetof(SyslLreBudget, stack_base)"
+
+// -- The struct that crosses the boundary ------------------------------------------------------
+
+@test("the budget is laid out exactly as the C struct it stands for")
+budget_layout_agrees_with_c()
+    assert_eq(sizeof(Budget), BUDGET_SIZE)
+    assert_eq(alignof(Budget), BUDGET_ALIGN)
+    assert_eq(offsetof(Budget, ticks), OFF_TICKS)
+    assert_eq(offsetof(Budget, stack_bytes), OFF_STACK_BYTES)
+    assert_eq(offsetof(Budget, gave_up), OFF_GAVE_UP)
+    assert_eq(offsetof(Budget, hit_stack), OFF_HIT_STACK)
+    assert_eq(offsetof(Budget, stack_base), OFF_STACK_BASE)
+
+@test("every flag is its own bit, so the nine of them can be held in one word")
+flag_bits_are_distinct()
+    val all = [FLAG_GLOBAL, FLAG_IGNORECASE, FLAG_MULTILINE, FLAG_DOTALL,
+               FLAG_UNICODE, FLAG_STICKY, FLAG_INDICES, FLAG_NAMED_GROUPS, FLAG_UNICODE_SETS]
+
+    var seen: i32 = 0
+
+    for i in 0..<all.len
+        assert(all[i] != 0, "every flag is a bit")
+        assert_eq(seen & all[i], 0)
+        seen = seen | all[i]
+
+@test("a group name is followed by two bytes and not one, which is the stride a reader needs")
+group_name_trailer_is_two()
+    assert_eq(GROUP_NAME_TRAILER_LEN, usize(2))
+
+// -- The calls ---------------------------------------------------------------------------------
+
+@test("the raw surface compiles a pattern and reports a capture as a pointer into the subject")
+raw_compile_and_match()
+    val src = "a(b+)c"
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var budget = Budget(-1, 0, 0, 0, isize(0))
+
+    val bc = compile(&len, as_mut_ptr(msg), 128, as_ptr(src.bytes), src.bytes.len, 0, &budget)
+
+    assert(bc != null, "the pattern compiled")
+    assert(len > 0, "and the bytecode has a length")
+    assert_eq(capture_count(bc), 2)
+    assert(alloc_count(bc) >= 4, "the capture array is sized past the group slots")
+
+    val subject = "xxabbbc"
+    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val base = as_ptr(subject.bytes)
+
+    assert_eq(exec(as_mut_ptr(caps), bc, base, 0, i32(subject.bytes.len), 0, &budget), 1)
+    assert_eq(usize(caps[0]) - usize(base), usize(2))
+    assert_eq(usize(caps[1]) - usize(base), usize(7))
+    assert_eq(usize(caps[2]) - usize(base), usize(3))
+    assert_eq(usize(caps[3]) - usize(base), usize(6))
+
+    free_bytecode(bc)
+
+@test("a group that took no part comes back as a null pointer, not as an empty span")
+unused_group_is_null()
+    val src = "(a)|(b)"
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var budget = Budget(-1, 0, 0, 0, isize(0))
+
+    val bc = compile(&len, as_mut_ptr(msg), 128, as_ptr(src.bytes), src.bytes.len, 0, &budget)
+
+    assert(bc != null, "the pattern compiled")
+
+    val subject = "b"
+    var caps: []*u8 = [null; usize(alloc_count(bc))]
+
+    assert_eq(exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, 1, 0, &budget), 1)
+    assert(caps[2] == null, "group 1 took no part")
+    assert(caps[4] != null, "and group 2 did")
+
+    free_bytecode(bc)
+
+@test("a spent budget stops the matcher and says so in the struct the caller placed")
+spent_budget_stops_the_matcher()
+    val src = "(a+)+$"
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var budget = Budget(1, 0, 0, 0, isize(0))
+
+    val bc = compile(&len, as_mut_ptr(msg), 128, as_ptr(src.bytes), src.bytes.len, 0, &budget)
+
+    assert(bc != null, "the pattern compiled")
+
+    val subject = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val rc = exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, i32(subject.bytes.len), 0, &budget)
+
+    assert_eq(rc, RET_TIMEOUT)
+    assert_eq(budget.gave_up, 1)
+    assert_eq(budget.hit_stack, 0, "it was the step budget, not the stack")
+
+    free_bytecode(bc)
+
+@test("an unlimited budget lets the same pathological match finish, so the budget is what stopped it")
+unlimited_budget_finishes()
+    val src = "(a+)+$"
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var budget = Budget(-1, 0, 0, 0, isize(0))
+
+    val bc = compile(&len, as_mut_ptr(msg), 128, as_ptr(src.bytes), src.bytes.len, 0, &budget)
+
+    assert(bc != null, "the pattern compiled")
+
+    val subject = "aaaaaaaaaaaaaaaaaaaab"
+    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val rc = exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, i32(subject.bytes.len), 0, &budget)
+
+    assert_eq(rc, 0, "twenty a's and a b finishes, and does not match")
+    assert_eq(budget.gave_up, 0)
+
+    free_bytecode(bc)
+
+@test("a pattern that is not one answers null and writes libregexp's own sentence")
+bad_pattern_answers_null_and_a_sentence()
+    val src = "a(b"
+    var msg: []u8 = [u8(0); 128]
+    var len: i32 = 0
+    var budget = Budget(-1, 0, 0, 0, isize(0))
+
+    val bc = compile(&len, as_mut_ptr(msg), 128, as_ptr(src.bytes), src.bytes.len, 0, &budget)
+
+    assert(bc == null, "an unbalanced parenthesis is not a pattern")
+    assert(msg[0] != u8(0), "and libregexp wrote why")

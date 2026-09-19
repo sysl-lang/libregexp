@@ -1,0 +1,47 @@
+// libregexp -- QuickJS's ECMAScript regular-expression engine, bound for sysl and carried here.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.0" }
+//     }
+//
+// The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is
+// the tag `v0.1.0` on this repository.
+//
+// **Nothing has to be installed.** libregexp is three C files and four headers, all vendored in
+// `sh/sysl/libregexp/c/`, so there is no `@link`, no `pkg_config` requirement, and no library for a
+// machine to be missing. That is the whole reason this package exists beside `sh.sysl.pcre2`: PCRE2
+// is half a megabyte of C with its own build system that a board will never have, and a
+// wasm32-wasi build cannot `brew install` anything.
+
+package {
+  name    = "libregexp"
+  version = "0.1.0"
+
+  // **The compiler this was written against**, which is a fact rather than a reconstruction:
+  // nothing here has been built with an older release. What it certainly needs is `isize`, a
+  // `c const` reading `offsetof` out of a vendored header in the same directory, and a `**u8`
+  // parameter -- the capture array libregexp writes.
+  sysl = "0.0.120"
+}
+
+// **`heap`, and nothing else.**
+//
+// libregexp allocates: the bytecode buffer it builds while compiling, the character-range sets a
+// class needs, and the backtracking stack once a match outgrows the thirty-two entries it keeps in
+// its own frame. Every one of those goes through `lre_realloc`, which `c/glue.c` answers with the C
+// library's `realloc` -- so the capability is real and stating it is honest.
+//
+// **What is NOT required is a clock**, and that is a design decision rather than an omission. The
+// obvious way to stop a pathological pattern is a deadline, and a deadline needs `time()`, which a
+// freestanding target does not have. libregexp's interrupt hook fires once per ten thousand
+// backtracking steps, so the budget here counts steps instead: available everywhere, and
+// reproducible, so a test can assert it.
+//
+// **There is no module-level storage anywhere in this package**, in sysl or in C. `glue.c` has no
+// `static` variable and the budget is a struct the caller places, which is what lets an `@export`
+// reach this code on a target with no loader to run an initializer.
+requires {
+  heap = true
+}

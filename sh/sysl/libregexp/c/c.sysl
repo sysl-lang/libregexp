@@ -1,0 +1,125 @@
+/** libregexp as C declares it: the compiler, the matcher, the numbers `libregexp.h` defines, and
+ * the three functions the header says the embedder owes.
+ *
+ * **Nothing here is meant to be called by a program.** A compiled pattern is a bare `*u8` of
+ * bytecode the caller has to free, a match writes *pointers into the subject* rather than offsets,
+ * the subject is Latin-1 or UTF-16 rather than UTF-8, and a failure is a small negative number. The
+ * module above turns those into a `&Regex`, a `Match` carrying byte spans into a sysl `string`, and
+ * a `Result`.
+ *
+ * **Everything that is C lives in this directory.** `libregexp.c`, `libunicode.c`, `cutils.c` and
+ * their headers are QuickJS's, byte for byte -- see the README for the release they came from and
+ * its SHA-256. `glue.c` and `glue.h` are this package's, and hold only what `libregexp.h`'s closing
+ * comment demands of whoever embeds the library.
+ *
+ * **There is no `@link`**, because there is no library to link: the implementation is the C carried
+ * here. That is what lets this package reach a target where nothing is installed.
+ */
+
+module sh.sysl.libregexp.c
+
+@include("libregexp.h")
+@include("glue.h")
+
+// ## The flags
+//
+// Every one is a `#define` over a bit, so there is no symbol for any of them and the numbers below
+// are the header's. `INDICES` is recorded in the bytecode and never read by the matcher -- libregexp
+// keeps it so an embedder can ask a compiled pattern which flags it was given.
+c const
+    FLAG_GLOBAL:        i32 = "LRE_FLAG_GLOBAL"
+    FLAG_IGNORECASE:    i32 = "LRE_FLAG_IGNORECASE"
+    FLAG_MULTILINE:     i32 = "LRE_FLAG_MULTILINE"
+    FLAG_DOTALL:        i32 = "LRE_FLAG_DOTALL"
+    FLAG_UNICODE:       i32 = "LRE_FLAG_UNICODE"
+    FLAG_STICKY:        i32 = "LRE_FLAG_STICKY"
+    FLAG_INDICES:       i32 = "LRE_FLAG_INDICES"
+    FLAG_NAMED_GROUPS:  i32 = "LRE_FLAG_NAMED_GROUPS"
+    FLAG_UNICODE_SETS:  i32 = "LRE_FLAG_UNICODE_SETS"
+
+// What `lre_exec` answers. 1 is a match and 0 is not one; the rest are failures.
+c const
+    RET_MEMORY_ERROR: i32 = "LRE_RET_MEMORY_ERROR"
+    RET_TIMEOUT:      i32 = "LRE_RET_TIMEOUT"
+
+    // The gap between one group name and the next in the block `groupnames` answers: the
+    // terminating NUL and one byte libregexp reserves. **Reading the names with a stride of
+    // `strlen + 1` walks off by one name per group**, which is why this is asked of the header
+    // rather than assumed.
+    GROUP_NAME_TRAILER_LEN: usize = "LRE_GROUP_NAME_TRAILER_LEN"
+
+// ## The budget
+//
+// The one piece of state this package has, and it is the *caller's*: `Budget` is a sysl struct laid
+// over `glue.h`'s `SyslLreBudget`, and its address is what crosses as libregexp's `opaque`. So there
+// is no module storage here, no static counter, and two matches running at once read two budgets.
+//
+// **`c/tests.sysl` asserts the size and every offset against the C**, so a change on either side
+// fails a test rather than corrupting a field at run time.
+struct Budget
+    // Remaining permissions to keep going, checked once per 10000 backtracking steps. Negative is
+    // unlimited.
+    ticks: i64
+
+    // How much C stack `compile` may descend through. Zero is unlimited. Matching does not recurse
+    // in C -- its backtracking stack is heap -- so this bounds the pattern parser only.
+    stack_bytes: i64
+
+    // Set by whichever check refused. It is the whole reason the budget is a struct rather than a
+    // number: `lre_exec` cannot report *why* it stopped beyond `RET_TIMEOUT`, and `lre_compile`
+    // reports a refused parse as an ordinary syntax error.
+    gave_up: i32
+
+    // 1 when it was the stack check rather than the ticks.
+    hit_stack: i32
+
+    // Written by the glue at each entry, read by the stack check. Never read here.
+    stack_base: isize
+end Budget
+
+// ## Compiling
+//
+// `error_msg` is caller storage the library writes a sentence into on failure; `plen` receives the
+// bytecode length. A null return is the only signal that it failed.
+//
+// **The pattern is UTF-8.** libregexp decodes it with `unicode_from_utf8`, which is why a sysl
+// `string` goes in unchanged -- and why the module above re-encodes an astral character as a
+// surrogate pair when the pattern is *not* a `u` pattern, matching what an ECMAScript engine hands
+// this same function.
+//
+// This is `glue.c`'s wrapper rather than `lre_compile` itself, so that the budget records the stack
+// it is being entered from before the parser starts to recurse.
+extern "sysl_lre_compile" compile(plen: *i32, error_msg: *u8, error_msg_size: i32, buf: *u8, buf_len: usize, re_flags: i32, b: *Budget) -> *u8
+
+// How many capture slots to allocate: `2 * capture_count` for the groups plus the pattern's
+// registers. **Sizing by `capture_count * 2` alone overflows the array**, since libregexp writes its
+// backreference registers into the same block.
+extern "lre_get_alloc_count" alloc_count(bc: *u8) -> i32
+
+// Groups including group 0, so a pattern with two groups answers 3.
+extern "lre_get_capture_count" capture_count(bc: *u8) -> i32
+
+// The flags the pattern was compiled with, read back out of the bytecode header.
+extern "lre_get_flags" flags_of(bc: *u8) -> i32
+
+// A block of `capture_count - 1` NUL-terminated UTF-8 names, one per group from 1 upwards, an
+// unnamed group contributing an empty one -- or null when the pattern declared no names at all.
+// Each name is followed by `GROUP_NAME_TRAILER_LEN` bytes rather than one.
+extern "lre_get_groupnames" groupnames(bc: *u8) -> *u8
+
+// ## Matching
+//
+// **`capture` comes back as pointers into `cbuf`, not as offsets**, and a group that took no part is
+// a null. **`cindex` and `clen` are in code units**, so they are bytes when `cbuf_type` is 0 and
+// `u16`s when it is 1 -- and `cbuf_type` is the shift between the two, which is how a pointer
+// becomes an index again.
+//
+// `cbuf_type` 0 is an 8-bit Latin-1 buffer and 1 is UTF-16. libregexp promotes 1 to its own internal
+// 2 when the pattern carries `u` or `v`, which is what makes a surrogate pair one character; a
+// caller never passes 2.
+//
+// Answers 1 for a match, 0 for none, and a negative `RET_` otherwise.
+extern "sysl_lre_exec" exec(capture: **u8, bc: *u8, cbuf: *u8, cindex: i32, clen: i32, cbuf_type: i32, b: *Budget) -> i32
+
+// Give the bytecode back to the allocator libregexp took it from.
+extern "sysl_lre_free_bytecode" free_bytecode(bc: *u8)
