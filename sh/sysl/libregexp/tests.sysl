@@ -459,3 +459,61 @@ source_and_flags_survive()
     assert_eq(r.source, "a(b)c")
     assert_eq(r.flags().text(), "gi")
     assert_eq(r.group_count(), usize(1))
+
+// -- The bytes the pattern is handed over as -------------------------------------------------------
+//
+// **`lre_compile` reads one byte past the length it is given, and requires it to be zero.** It ends
+// a parse by testing `*buf_ptr` against `'\0'` to decide whether anything was left over, and
+// `re_parse_disjunction` tests the same byte against `'|'` before it stops -- so the byte after the
+// pattern decides both whether it compiles and, if it is a `|`, how far past the end the parser
+// walks.
+//
+// **A pattern written as a literal is terminated by luck**, because the compiler lays a zero after
+// a static string, so no test written against one can see this. A substring is a *view* of its
+// parent's bytes (`s.copy()` is what stops it being one), so slicing a pattern out of a longer
+// string is the case a program actually hits: a pattern read out of a configuration line, a wire
+// frame, or a file.
+
+@test("a pattern sliced out of a longer string compiles as the pattern and not as what follows it")
+a_pattern_that_is_not_followed_by_a_zero_byte()
+    val bracketed = "a+b)))"
+    val barred = "a+b|zzz"
+
+    assert_eq(bracketed[0..<3], "a+b", "the pattern is the first three bytes and the rest is not")
+    assert_eq(ok(re(bracketed[0..<3], "").find("xaabz")).text(), "aab")
+    assert_eq(ok(re(barred[0..<3], "").find("xaabz")).text(), "aab",
+              "the | after it is not an alternative of it")
+
+@test("an astral pattern that outgrows its re-encoding buffer compiles, and that buffer never zeroes")
+an_astral_pattern_longer_than_the_room_it_was_given()
+    // Without `u` the pattern goes over as CESU-8, into a buffer this package grows as it writes:
+    // five astral characters are twenty bytes of UTF-8 and thirty of CESU-8. Growth makes the new
+    // storage by repeating an element, so what sits after the last byte written is a copy of one of
+    // the pattern's -- never a zero, on any platform.
+    val m = ok(re("\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}a", "")
+                   .find("x\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}ay"))
+
+    assert_eq(m.text(), "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}a")
+    assert_eq(m.start(), usize(1))
+
+@test("a subject sliced out of a longer string ends where the slice ends, anchors and boundaries too")
+a_subject_that_is_not_followed_by_a_zero_byte()
+    // **The subject side asks for no terminator and never reads for one**, which is worth a test
+    // rather than a sentence: `lre_exec` takes a length, converts it to an end pointer, and every
+    // read in the matcher -- forwards, backwards, and the peek a `\b` does -- is bounded by that
+    // pointer or by the start. So a subject that is a view of a longer string is exactly as long as
+    // the view says.
+    val source = "aabzzz"
+    val subj = source[0..<3]
+
+    assert_eq(ok(re("b$", "").find(subj)).start(), usize(2), "the end of the subject is the view's")
+    assert_eq(ok(re("b\\b", "").find(subj)).start(), usize(2), "and so is the word boundary")
+    assert(re("bz", "").find(subj).expect("ran").is_none(), "what follows the view is not the subject")
+
+@test("an empty pattern sliced out of a non-empty string is still the empty pattern")
+an_empty_pattern_that_has_bytes_after_it()
+    val source = ")))"
+    val empty = source[0..<0]
+
+    assert_eq(empty.bytes.len, usize(0))
+    assert_eq(re(empty, "").replace_all("abc", "-").expect("ran"), "-a-b-c-")

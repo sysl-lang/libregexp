@@ -662,23 +662,16 @@ compile_with(pattern: string, fl: Flags, budget: Budget) -> Result[&Regex, Error
     // pattern would silently match nothing.
     //
     // The buffer is held in a local for as long as the call needs it: a `view()` into a `Buf` whose
-    // last reference has gone is storage that has been freed.
-    val needs = !fl.code_points() && has_astral(pattern)
-    val holder: &Buf[u8] = if needs then cesu8(pattern) else buf()
-    val p: []const u8 = if needs then holder.view() else pattern.bytes
+    // last reference has gone is storage that has been freed. It carries the zero byte libregexp
+    // reads past the length -- see `terminated` -- so `held.len` is one more than the pattern's.
+    val holder = terminated(pattern, !fl.code_points() && has_astral(pattern))
+    val held: []const u8 = holder.view()
 
     var msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var b = c.Budget(budget.steps, budget.stack_bytes, 0, 0, isize(0))
 
-    // **An empty pattern is a legal pattern and a null pointer is not one.** `as_ptr` of an empty
-    // slice answers null, and libregexp reads its pattern through `buf_ptr` without checking it, so
-    // `compile("", "")` -- which ECMAScript accepts and which matches at every position -- would
-    // fault. One byte of storage this function owns is the whole of the fix.
-    var pad: []u8 = [u8(0); 1]
-    val start = if p.len == 0 then as_mut_ptr(pad) else as_ptr(p)
-
-    val bc = c.compile(&len, as_mut_ptr(msg), 128, start, p.len, fl.bits, &b)
+    val bc = c.compile(&len, as_mut_ptr(msg), 128, as_ptr(held), held.len - 1, fl.bits, &b)
 
     if bc == null
         if b.hit_stack != 0 then return Err(TooDeep)
@@ -844,6 +837,35 @@ private has_astral(s: string) -> bool
 
     false
 end has_astral
+
+/** The bytes `lre_compile` is given, in storage this package owns, with a zero byte written after
+ * them that is not counted in the length.
+ *
+ * **libregexp reads `buf[buf_len]` and requires it to be zero**, which its header does not say and
+ * which nothing in its signature suggests: it ends a parse by testing that byte against `'\0'` to
+ * decide whether anything was left over, and `re_parse_disjunction` tests it against `'|'` before it
+ * stops reading alternatives. So a pattern the caller did not terminate is refused with "extraneous
+ * characters at the end" when the byte after it happens to be printable, and *read past its end*
+ * when that byte happens to be a `|`.
+ *
+ * **What makes it a trap is that a pattern written as a literal is terminated by accident.** A
+ * `string` is a view of bytes and a length, and nothing about it says what the next byte holds: a
+ * literal is followed by the zero the compiler laid after it, and a substring, a pattern read off a
+ * wire, and one built at run time are followed by whatever was there. The failure is therefore
+ * invisible to a test written against a literal and arrives on a caller's own pattern.
+ *
+ * It settles the empty pattern at the same time, which ECMAScript accepts and which matches at every
+ * position: the buffer is never empty, so `as_ptr` of it is never the null pointer libregexp reads
+ * through without checking.
+ */
+private terminated(s: string, as_cesu8: bool) -> &Buf[u8]
+    var out: &Buf[u8] = if as_cesu8 then cesu8(s) else buf_with_capacity(s.bytes.len + 1, u8(0))
+
+    if !as_cesu8 then out.extend(s.bytes)
+
+    out.push(u8(0))
+    out
+end terminated
 
 /** The pattern re-encoded the way a JavaScript engine hands it to `lre_compile` when the pattern is
  * not a `u` pattern: every astral character as its UTF-16 surrogate pair, each surrogate written as

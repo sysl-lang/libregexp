@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.0" }
+//       libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.1" }
 //     }
 //
 // The coordinate is an identity rather than a URL, so it carries no `https://`, and `version` is
-// the tag `v0.1.0` on this repository.
+// the tag `v0.1.1` on this repository.
 //
 // **Nothing has to be installed.** libregexp is three C files and four headers, all vendored in
 // `sh/sysl/libregexp/c/`, so there is no `@link`, no `pkg_config` requirement, and no library for a
@@ -17,7 +17,7 @@
 
 package {
   name    = "libregexp"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // **The compiler this was written against**, which is a fact rather than a reconstruction:
   // nothing here has been built with an older release. What it certainly needs is `isize`, a

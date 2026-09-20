@@ -5,7 +5,7 @@ carried here, so there is nothing to install and nothing for a target to be miss
 
 ```hocon
 dependencies {
-  libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.0" }
+  libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.1" }
 }
 ```
 
