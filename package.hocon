@@ -23,7 +23,7 @@ package {
   // nothing here has been built with an older release. What it certainly needs is `isize`, a
   // `c const` reading `offsetof` out of a vendored header in the same directory, and a `**u8`
   // parameter -- the capture array libregexp writes.
-  sysl = "0.0.120"
+  sysl = "0.1.0-alpha.8"
 }
 
 // **`heap`, and nothing else.**

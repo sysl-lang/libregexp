@@ -502,14 +502,14 @@ struct Regex
 
         // The capture array is sized by `alloc_count`, not by the group count: libregexp writes its
         // backreference registers into the same block, past the group slots.
-        var caps: []*u8 = [null; usize(c.alloc_count(self.bc))]
+        val caps: []*u8 = [null; usize(c.alloc_count(self.bc))]
 
         var b = c.Budget(self.budget.steps, self.budget.stack_bytes, 0, 0, isize(0))
 
         // An empty subject is a legal subject, and `as_ptr` of an empty slice is null -- which
         // libregexp dereferences. One byte this frame owns stands in for it; `clen` is zero, so
         // nothing is read through it.
-        var pad: []u8 = [u8(0); 1]
+        val pad: []u8 = [u8(0); 1]
 
         val base: *u8 =
             if n == 0 then
@@ -531,7 +531,7 @@ struct Regex
         if rc == 0 then return Ok(None)
 
         val pairs = self.groups + 1
-        var slots: []int = [-1; pairs * 2]
+        val slots: []int = [-1; pairs * 2]
 
         for i in 0..<(pairs * 2)
             val p = caps[i]
@@ -667,7 +667,7 @@ compile_with(pattern: string, fl: Flags, budget: Budget) -> Result[&Regex, Error
     val holder = terminated(pattern, !fl.code_points() && has_astral(pattern))
     val held: []const u8 = holder.view()
 
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var b = c.Budget(budget.steps, budget.stack_bytes, 0, 0, isize(0))
 
