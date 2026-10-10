@@ -57,7 +57,7 @@ group_name_trailer_is_two()
 @test("the raw surface compiles a pattern and reports a capture as a pointer into the subject")
 raw_compile_and_match()
     val src = "a(b+)c"
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var budget = Budget(-1, 0, 0, 0, isize(0))
 
@@ -69,7 +69,7 @@ raw_compile_and_match()
     assert(alloc_count(bc) >= 4, "the capture array is sized past the group slots")
 
     val subject = "xxabbbc"
-    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val caps: []*u8 = [null; usize(alloc_count(bc))]
     val base = as_ptr(subject.bytes)
 
     assert_eq(exec(as_mut_ptr(caps), bc, base, 0, i32(subject.bytes.len), 0, &budget), 1)
@@ -83,7 +83,7 @@ raw_compile_and_match()
 @test("a group that took no part comes back as a null pointer, not as an empty span")
 unused_group_is_null()
     val src = "(a)|(b)"
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var budget = Budget(-1, 0, 0, 0, isize(0))
 
@@ -92,7 +92,7 @@ unused_group_is_null()
     assert(bc != null, "the pattern compiled")
 
     val subject = "b"
-    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val caps: []*u8 = [null; usize(alloc_count(bc))]
 
     assert_eq(exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, 1, 0, &budget), 1)
     assert(caps[2] == null, "group 1 took no part")
@@ -103,7 +103,7 @@ unused_group_is_null()
 @test("a spent budget stops the matcher and says so in the struct the caller placed")
 spent_budget_stops_the_matcher()
     val src = "(a+)+$"
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var budget = Budget(1, 0, 0, 0, isize(0))
 
@@ -112,7 +112,7 @@ spent_budget_stops_the_matcher()
     assert(bc != null, "the pattern compiled")
 
     val subject = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
-    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val caps: []*u8 = [null; usize(alloc_count(bc))]
     val rc = exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, i32(subject.bytes.len), 0, &budget)
 
     assert_eq(rc, RET_TIMEOUT)
@@ -124,7 +124,7 @@ spent_budget_stops_the_matcher()
 @test("an unlimited budget lets the same pathological match finish, so the budget is what stopped it")
 unlimited_budget_finishes()
     val src = "(a+)+$"
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var budget = Budget(-1, 0, 0, 0, isize(0))
 
@@ -133,7 +133,7 @@ unlimited_budget_finishes()
     assert(bc != null, "the pattern compiled")
 
     val subject = "aaaaaaaaaaaaaaaaaaaab"
-    var caps: []*u8 = [null; usize(alloc_count(bc))]
+    val caps: []*u8 = [null; usize(alloc_count(bc))]
     val rc = exec(as_mut_ptr(caps), bc, as_ptr(subject.bytes), 0, i32(subject.bytes.len), 0, &budget)
 
     assert_eq(rc, 0, "twenty a's and a b finishes, and does not match")
@@ -144,7 +144,7 @@ unlimited_budget_finishes()
 @test("a pattern that is not one answers null and writes libregexp's own sentence")
 bad_pattern_answers_null_and_a_sentence()
     val src = "a(b"
-    var msg: []u8 = [u8(0); 128]
+    val msg: []u8 = [u8(0); 128]
     var len: i32 = 0
     var budget = Budget(-1, 0, 0, 0, isize(0))
 
