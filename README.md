@@ -3,6 +3,8 @@
 **ECMAScript regular expressions for [sysl](https://github.com/sysl-lang/sysl) — QuickJS's engine,
 carried here, so there is nothing to install and nothing for a target to be missing.**
 
+*An independent sysl package for QuickJS. It is not affiliated with or endorsed by QuickJS's authors or trademark holders.*
+
 ```hocon
 dependencies {
   libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.3" }
