@@ -4,6 +4,7 @@ import sh.sysl.libregexp.c
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.text.{Ascii, StrBuilder, char_indices, chars_of, from_utf8, is_char_boundary, str_builder}
 import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.raw.ptr_cast
 
 /** ECMAScript regular expressions for sysl, over the engine QuickJS uses -- carried here, so there
  * is nothing to install and nothing for a target to be missing.

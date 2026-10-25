@@ -7,7 +7,7 @@ carried here, so there is nothing to install and nothing for a target to be miss
 
 ```hocon
 dependencies {
-  libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.3" }
+  libregexp { git = "github.com/sysl-lang/libregexp", version = "0.1.4" }
 }
 ```
 
@@ -62,7 +62,7 @@ sh/sysl/libregexp/
         cutils.c           |
         cutils.h        ---+
 LICENSE                 ISC for the binding, MIT for the vendored engine
-package.hocon           who this package is, and what it needs of the machine
+sysl.hocon              who this package is, and what it needs of the machine
 ```
 
 **Everything that is C lives in `c/`**, module `sh.sysl.libregexp.c`. That is the two-layer shape
